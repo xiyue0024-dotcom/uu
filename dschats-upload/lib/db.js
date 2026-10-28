@@ -18,6 +18,7 @@ function emptyDb() {
     flowEvents: [],
     knowledge: [],
     settings: [],
+    llmConfigs: [],
     usage: [],
     audit: [],
     meta: { createdAt: new Date().toISOString() }

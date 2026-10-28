@@ -205,12 +205,12 @@
       <div class="step-card">
         <div class="step-num">02 / 开箱</div>
         <h3>不配置也能跑</h3>
-        <p>未接模型时使用内置规则引擎，注册后即可完整体验；填入 API Key 自动升级为真实大模型。</p>
+        <p>未接模型时使用内置规则引擎，注册后即可完整体验；登录后在「设置 → AI 模型」填自己的 API Key，自动升级为真实大模型。</p>
       </div>
       <div class="step-card">
         <div class="step-num">03 / 本地</div>
-        <h3>数据留在你的机器</h3>
-        <p>联系人、记忆与消息写入本地 JSON 文件，不上传任何第三方。</p>
+        <h3>Key 是你自己的</h3>
+        <p>每个账号用自己的 Key，加密存储、只存密文，用完各自的额度，部署包里不含任何密钥。</p>
       </div>
     </div>
   </div>
@@ -241,7 +241,11 @@
       </details>
       <details>
         <summary>需要付费吗？有套餐限制吗？</summary>
-        <div class="answer">不需要。本复刻版已移除套餐与付费墙，注册后即可使用全部功能，也不限制账号数量。若你自行接入大模型 API，费用由模型服务商按用量收取。</div>
+        <div class="answer">不需要。本复刻版已移除套餐与付费墙，注册后即可使用全部功能，也不限制账号数量。大模型 Key 由你自己提供：登录后在「设置 → AI 模型」里填写，费用直接由模型服务商按你的用量收取，平台不经手。不填也能用内置规则引擎。</div>
+      </details>
+      <details>
+        <summary>我的 API Key 安全吗？</summary>
+        <div class="answer">Key 用 AES-256-GCM 加密后存在服务器的 <code>data/db.json</code>，加密主密钥是服务器本地生成的 <code>data/.secret</code>。接口只返回掩码（如 <code>gsk_••••••••OfH2</code>），明文永远不会回传到浏览器，也不会出现在任何部署文件里。你可以随时在设置里覆盖或清除。</div>
       </details>
       <details>
         <summary>这是官方产品吗？</summary>

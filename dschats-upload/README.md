@@ -49,15 +49,27 @@ node server.js
 
 ---
 
-## 三、接入真实大模型
+## 三、接入真实大模型（用户自己在网页里填 Key）
 
-复制 `.env.example` 为 `.env`。当前默认接 **Groq**（OpenAI 兼容协议）：
+**部署包里没有任何 API Key，也不需要配。** 每个账号登录后在自己的
+「**设置 → AI 模型**」里填写，按用户隔离存储。
 
-```env
-LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_API_KEY=gsk_xxxxxxxx
-LLM_MODEL=qwen/qwen3.8-27b
-```
+操作路径：
+
+1. 注册 / 登录，进入工作台 → 左侧「设置」；
+2. 「AI 模型」面板里选服务商（Groq / OpenAI / DeepSeek / Moonshot / 自定义）；
+3. 粘贴自己的 API Key，点「测试连接」，看到「连接成功」再点「保存」。
+
+内置服务商预设：
+
+| 服务商 | Base URL | 默认模型 | 申请地址 |
+|---|---|---|---|
+| Groq（默认） | `https://api.groq.com/openai/v1` | `qwen/qwen3.8-27b` | console.groq.com/keys |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | platform.openai.com/api-keys |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` | platform.deepseek.com/api_keys |
+| Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` | platform.moonshot.cn |
+
+也可以选「自定义」，填任意 OpenAI 兼容地址，包括本地 Ollama（`http://127.0.0.1:11434/v1`）。
 
 Groq 可用模型（以 `/openai/v1/models` 返回为准）：
 
@@ -67,10 +79,18 @@ Groq 可用模型（以 `/openai/v1/models` 返回为准）：
 | `openai/gpt-oss-20b` | 轻量，速度快 |
 | `openai/gpt-oss-120b` | 更强，但会消耗推理 token，需调大 `max_tokens` |
 
-换其他厂商也只需改这三行（OpenAI、DeepSeek、通义、Kimi、本地 Ollama 均兼容）。
-未配置时自动使用**本地规则引擎**：按意图与语气模板生成回复，并注入命中的记忆，保证离线可演示。
+**Key 是怎么存的**
 
-> 安全提示：`.env` 含密钥，已加入 `.gitignore`，不要提交或打包上传。
+- 用 AES-256-GCM 加密后写进 `data/db.json` 的 `apiKeyEnc` 字段；
+- 加密主密钥是服务器首次启动时自动生成的 `data/.secret`（权限 0600），不来自 `.env`、不进部署包；
+- 接口只返回掩码（如 `gsk_••••••••OfH2`），明文 Key 不会回传到浏览器；
+- 想换 Key 直接覆盖填写；想停用点「清除 Key」。
+
+**没填 Key 也能用**：自动使用**本地规则引擎**——按意图识别 + 语气模板生成回复，
+并注入命中的记忆，保证离线可演示完整流程。
+
+> 备份提醒：`data/.secret` 必须和 `data/db.json` 一起备份。
+> 只恢复 db.json 而丢了 `.secret`，已保存的 Key 解不开，用户需要重新填一次。
 
 > ⚠️ 不要尝试调用 `dschats.com` 的接口来「借用算力」。
 > `api.dschats.com` 是它自己的业务后端，没有公开文档、API Key 或按量计费，且条款禁止未授权访问。
@@ -103,6 +123,7 @@ dschats-clone/
 ├── lib/
 │   ├── db.js              # JSON 存储 + 原子写入
 │   ├── auth.js            # scrypt 哈希、会话令牌
+│   ├── secret.js          # API Key 的 AES-256-GCM 加解密
 │   ├── ai.js              # 提示词拼装、LLM 调用、本地规则引擎、翻译
 │   └── telegram.js        # Bot API 长轮询
 ├── public/
@@ -111,7 +132,9 @@ dschats-clone/
 │   ├── workspace.html     # 工作台骨架
 │   ├── css/{base,landing,app}.css
 │   └── js/{auth,workspace}.js
-├── data/db.json           # 运行时生成
+├── data/
+│   ├── db.json            # 运行时生成（含加密后的 Key）
+│   └── .secret            # 运行时生成（加密主密钥，务必一起备份）
 ├── .env.example
 └── README.md
 ```
@@ -147,6 +170,10 @@ dschats-clone/
 | GET | `/api/audit?type=` | 审计日志 |
 | GET | `/api/usage` | 用量与 7 日趋势 |
 | PATCH | `/api/settings` | 自动化与安全设置 |
+| GET | `/api/llm` | 自己的模型配置（只返回掩码）+ 服务商预设 |
+| PATCH | `/api/llm` | 保存自己的 Base URL / 模型 / API Key |
+| POST | `/api/llm/test` | 测试连接（可用未保存的表单值） |
+| DELETE | `/api/llm` | 清除自己的 API Key，退回本地引擎 |
 
 ---
 
@@ -155,8 +182,10 @@ dschats-clone/
 本复刻版是**单角色**设计，没有独立的管理员后台：
 
 - **工作区用户**：对自己工作区拥有全部权限——联系人、记忆、流程、知识库、审计、自动化设置、删除数据。
-- **部署者（你）**：拥有服务器、`data/db.json`、`.env` 的完全控制权，可查看/修改所有数据、重置实例、配置模型与通道。
-- **没有**：跨用户管理、账号封禁、角色分配、全局公告等运营后台。
+- **部署者（你）**：拥有服务器、`data/db.json`、`data/.secret`、`.env` 的完全控制权，可查看/修改所有数据、重置实例、配置 Telegram 通道。
+  注意：你**看不到**用户填的明文 Key（只存密文），但可以直接删掉某条 `llmConfigs` 记录或整个 `data/db.json`。
+- **每个用户**：只能读写自己的联系人、记忆、流程、知识库、审计，以及自己的模型配置。
+- **没有**：跨用户管理界面、账号封禁、角色分配、全局公告等运营后台。
 
 如果要多用户运营，建议补：`role` 字段（admin/user）、管理员路由守卫、用户列表与用量统计、账号禁用与配额管理。
 
@@ -170,7 +199,8 @@ dschats-clone/
 - **全量留痕**：AI 生成 / AI 发送 / 人工发送 / 流程状态 / 设置变更分别记录；
 - **会话安全**：密码 scrypt + 随机盐，Cookie `HttpOnly` + `SameSite=Lax`，登录失败限流；
 - **响应头**：CSP、`X-Frame-Options: DENY`、`nosniff`、`no-referrer`、`Permissions-Policy`；
-- **数据本地**：仅写入 `data/db.json`，不上传任何第三方（除非你主动配置 LLM/Telegram）。
+- **数据本地**：仅写入 `data/db.json`，不上传任何第三方（除非你主动配置 LLM/Telegram）；
+- **模型 Key 加密**：用户自己的 API Key 用 AES-256-GCM 加密存 `apiKeyEnc`，主密钥在 `data/.secret`，接口只回掩码，明文永不出服务端。
 
 ---
 

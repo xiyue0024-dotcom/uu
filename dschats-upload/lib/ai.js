@@ -2,13 +2,23 @@
 
 /**
  * AI 回复引擎
- * - 配置 LLM_API_KEY 时走 OpenAI 兼容接口
- * - 未配置时使用本地规则引擎（离线可用，用于演示记忆与语气效果）
+ * - 每个用户使用自己在网页里配置的 API Key（OpenAI 兼容协议）
+ * - 未配置 Key 时使用本地规则引擎（离线可用，用于演示记忆与语气效果）
  */
 
-const LLM_BASE_URL = (process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
-const LLM_API_KEY = process.env.LLM_API_KEY || '';
-const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
+const DEFAULT_BASE_URL = 'https://api.groq.com/openai/v1';
+const DEFAULT_MODEL = 'qwen/qwen3.8-27b';
+
+function normalizeLlm(llm) {
+  const rawBase = String((llm && llm.baseUrl) || '').trim().replace(/\/+$/, '');
+  const apiKey = String((llm && llm.apiKey) || '').trim();
+  const model = String((llm && llm.model) || '').trim() || DEFAULT_MODEL;
+  return {
+    baseUrl: rawBase || DEFAULT_BASE_URL,
+    apiKey,
+    model
+  };
+}
 
 const TONE_LABEL = {
   warm: '温和体贴',
@@ -251,18 +261,20 @@ function buildPrompt(ctx) {
   ].join('\n');
 }
 
-async function llmCall(messages, { temperature = 0.8, maxTokens = 220 } = {}) {
+async function llmCall(messages, { temperature = 0.8, maxTokens = 220 } = {}, llm) {
+  const cfg = normalizeLlm(llm);
+  if (!cfg.apiKey) throw new Error('未配置 API Key');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    const resp = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${LLM_API_KEY}`
+        Authorization: `Bearer ${cfg.apiKey}`
       },
       body: JSON.stringify({
-        model: LLM_MODEL,
+        model: cfg.model,
         messages,
         temperature,
         max_tokens: maxTokens
@@ -285,11 +297,11 @@ async function llmCall(messages, { temperature = 0.8, maxTokens = 220 } = {}) {
   }
 }
 
-async function llmComplete(messages, opts = {}) {
+async function llmComplete(messages, opts = {}, llm) {
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await llmCall(messages, opts);
+      return await llmCall(messages, opts, llm);
     } catch (e) {
       lastErr = e;
       const retryable = e.status === 429 || (e.status >= 500 && e.status < 600) || e.name === 'AbortError';
@@ -309,14 +321,15 @@ function cleanOutput(text) {
     .trim();
 }
 
-async function draftReply(ctx) {
+async function draftReply(ctx, llm) {
   const fallback = localDraft(ctx);
-  if (!LLM_API_KEY) return fallback;
+  const cfg = normalizeLlm(llm);
+  if (!cfg.apiKey) return fallback;
   try {
     const text = await llmComplete([
       { role: 'system', content: buildPrompt(ctx) },
       { role: 'user', content: '请直接给出这一条回复。' }
-    ]);
+    ], {}, cfg);
     if (!text) return fallback;
     return {
       text: cleanOutput(text),
@@ -337,10 +350,11 @@ const OFFLINE_DICT = [
   ['多少钱', 'How much is it?'], ['明天见', 'See you tomorrow'], ['我想你', 'I miss you']
 ];
 
-async function translate(text, target = 'en') {
+async function translate(text, target = 'en', llm) {
   const raw = String(text || '').trim();
   if (!raw) return { text: '', engine: 'none' };
-  if (!LLM_API_KEY) {
+  const cfg = normalizeLlm(llm);
+  if (!cfg.apiKey) {
     let out = raw;
     for (const [zh, en] of OFFLINE_DICT) {
       if (target === 'en' && out.includes(zh)) out = out.split(zh).join(en);
@@ -349,7 +363,7 @@ async function translate(text, target = 'en') {
     return {
       text: out,
       engine: out === raw ? 'offline' : 'dictionary',
-      note: out === raw ? '未配置翻译模型，返回原文' : undefined
+      note: out === raw ? '未配置模型 API Key，返回原文' : undefined
     };
   }
   try {
@@ -359,20 +373,115 @@ async function translate(text, target = 'en') {
         content: `你是翻译引擎。把用户输入翻译成${target === 'en' ? '英文' : '简体中文'}，保留语气与口语感，只输出译文，不要解释。`
       },
       { role: 'user', content: raw }
-    ], { temperature: 0.3, maxTokens: 400 });
+    ], { temperature: 0.3, maxTokens: 400 }, cfg);
     return { text: cleanOutput(out) || raw, engine: 'llm' };
   } catch (e) {
     return { text: raw, engine: 'offline', note: e.message };
   }
 }
 
-function engineInfo() {
+function engineInfo(llm) {
+  const cfg = normalizeLlm(llm);
   return {
-    engine: LLM_API_KEY ? 'llm' : 'local',
-    model: LLM_API_KEY ? LLM_MODEL : '本地规则引擎',
-    baseUrl: LLM_API_KEY ? LLM_BASE_URL : null
+    engine: cfg.apiKey ? 'llm' : 'local',
+    model: cfg.apiKey ? cfg.model : '本地规则引擎',
+    baseUrl: cfg.apiKey ? cfg.baseUrl : null,
+    hasKey: Boolean(cfg.apiKey)
   };
 }
+
+/**
+ * 用最小请求验证用户的 Key / 地址 / 模型是否可用
+ * 成功返回 { ok:true, model, latencyMs, sample }
+ */
+async function testConnection(llm) {
+  const cfg = normalizeLlm(llm);
+  if (!cfg.apiKey) {
+    return { ok: false, error: '还没填写 API Key' };
+  }
+  const started = Date.now();
+  try {
+    const text = await llmCall([
+      { role: 'system', content: '你是一个连通性测试助手。' },
+      { role: 'user', content: '只回复两个字：可用' }
+    ], { temperature: 0, maxTokens: 16 }, cfg);
+    return {
+      ok: true,
+      model: cfg.model,
+      baseUrl: cfg.baseUrl,
+      latencyMs: Date.now() - started,
+      sample: cleanOutput(text).slice(0, 40)
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      status: e.status || null,
+      latencyMs: Date.now() - started,
+      error: friendlyError(e)
+    };
+  }
+}
+
+function friendlyError(e) {
+  const msg = String((e && e.message) || e || '');
+  const status = e && e.status;
+  if (status === 401 || status === 403) return 'API Key 无效或没有权限（401/403），请检查是否复制完整';
+  if (status === 404) return '接口地址或模型名不存在（404），请检查 Base URL 是否带 /v1、模型名是否拼写正确';
+  if (status === 429) return '触发限流（429），Key 是有效的，稍后再试或换一个模型';
+  if (status >= 500) return `模型服务端错误（${status}），稍后再试`;
+  if (e && e.name === 'AbortError') return '请求超时（30s），请检查网络或接口地址';
+  if (/fetch failed|ENOTFOUND|ECONNREFUSED|getaddrinfo/i.test(msg)) return '无法连接该地址，请检查 Base URL 是否正确、服务器能否出网';
+  return msg.slice(0, 200) || '未知错误';
+}
+
+/** 常见服务商预设，供前端下拉选择 */
+const PRESETS = [
+  {
+    id: 'groq',
+    label: 'Groq（推荐，速度快、有免费额度）',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    model: 'qwen/qwen3.8-27b',
+    models: ['qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'],
+    keyUrl: 'https://console.groq.com/keys',
+    keyPrefix: 'gsk_'
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI 官方',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini'],
+    keyUrl: 'https://platform.openai.com/api-keys',
+    keyPrefix: 'sk-'
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek（国内直连，便宜）',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
+    models: ['deepseek-chat', 'deepseek-reasoner'],
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+    keyPrefix: 'sk-'
+  },
+  {
+    id: 'moonshot',
+    label: 'Moonshot / Kimi',
+    baseUrl: 'https://api.moonshot.cn/v1',
+    model: 'moonshot-v1-8k',
+    models: ['moonshot-v1-8k', 'moonshot-v1-32k'],
+    keyUrl: 'https://platform.moonshot.cn/console/api-keys',
+    keyPrefix: 'sk-'
+  },
+  {
+    id: 'custom',
+    label: '自定义（任意 OpenAI 兼容接口 / 本地 Ollama）',
+    baseUrl: '',
+    model: '',
+    models: [],
+    keyUrl: '',
+    keyPrefix: ''
+  }
+];
 
 module.exports = {
   draftReply,
@@ -381,5 +490,11 @@ module.exports = {
   pickMemories,
   detectIntent,
   engineInfo,
+  testConnection,
+  normalizeLlm,
+  friendlyError,
+  PRESETS,
+  DEFAULT_BASE_URL,
+  DEFAULT_MODEL,
   TONE_LABEL
 };

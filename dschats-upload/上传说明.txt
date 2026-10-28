@@ -5,29 +5,50 @@
 
 上传后执行：
   cd /var/www/dschats
-  chmod 600 .env
   chmod 700 data
+  chmod 600 .env
   node server.js
 
 然后浏览器打开 http://服务器IP:5173
 （如果用 Nginx 反代，保持 .env 里 HOST=127.0.0.1，把 80/443 转发到 127.0.0.1:5173）
 
+
+关于 API Key（重要）
+------------------------------------
+这个包里没有任何 API Key，也不需要你配。
+
+模型 Key 由每个用户登录后在自己的「设置 → AI 模型」里填写：
+  - 选服务商（Groq / OpenAI / DeepSeek / Moonshot / 自定义）
+  - 粘贴自己的 Key，点「测试连接」，通了再点「保存」
+
+Key 会用 AES-256-GCM 加密后存进 data/db.json，接口只返回掩码，
+明文不会回传到浏览器，也不会出现在任何部署文件里。
+
+不填 Key 也能正常用：系统会自动走内置的本地规则引擎，
+按意图 + 语气模板生成回复，功能演示不受影响。
+
+每个账号的 Key 互相隔离，用的是各自的额度，互不影响。
+
+
 目录说明
 ------------------------------------
 server.js            服务入口
 package.json         启动脚本与 Node 版本声明
-lib/                 后端模块（存储、认证、AI、Telegram）
+lib/                 后端模块（存储、认证、密钥加密、AI、Telegram）
 public/              前端页面与静态资源
-data/                运行时数据目录，首次注册自动生成 db.json
-.env                 运行配置（含 Groq 密钥）
+data/                运行时数据目录，首次启动自动生成 db.json 和 .secret
+.env                 运行配置（只有端口和 Telegram Token，没有密钥）
 .env.example         配置模板
 DEPLOY.md            完整部署文档（Nginx / systemd / pm2 / 排错）
 README.md            功能说明与 API 列表
 
+
 注意
 ------------------------------------
-1. .env 内含 API 密钥，不要公开分享这个文件夹。
-2. data/ 必须可写，db.json 是唯一数据源，记得定期备份。
+1. 这个文件夹不含任何密钥，可以正常分享/备份。
+2. data/ 必须可写。db.json 是数据源，.secret 是加密主密钥，
+   两个必须一起备份——只恢复 db.json 会导致用户已填的 Key 解不开。
 3. 只能单进程运行，不要用 pm2 cluster 或多实例，否则数据会互相覆盖。
 4. 需要 Node.js 18 及以上；本项目零 npm 依赖，不用 npm install。
 5. 不要放到 Vercel / Netlify 这类无状态托管，必须是有持久磁盘的服务器。
+6. 首次启动会自动创建 data/.secret，不要手动删它，也不要提交到 git。

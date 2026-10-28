@@ -19,6 +19,8 @@ const S = {
   stats: null,
   audit: [],
   engine: null,
+  llm: null,
+  presets: [],
   telegram: null,
   currentView: 'overview',
   currentContactId: null,
@@ -154,6 +156,8 @@ async function loadBootstrap() {
   S.stats = data.stats;
   S.audit = data.audit;
   S.engine = data.engine;
+  S.llm = data.llm || null;
+  S.presets = data.presets || [];
   S.telegram = data.telegram;
   syncChrome();
 }
@@ -255,6 +259,7 @@ views.overview = {
               <div class="usage-bar"><i style="width:${pct}%"></i></div>
               <div class="kv" style="margin-top:10px"><span class="k">剩余额度</span><span class="v">${S.usage.remaining} 条</span></div>
               <div class="kv"><span class="k">AI 引擎</span><span class="v">${esc(S.engine.model)}</span></div>
+              ${S.llm && !S.llm.hasKey ? '<a class="btn btn-ghost btn-block btn-sm" href="#/settings" style="margin-top:10px;border-color:#fcd34d;background:#fffbeb;color:#92400e">还没填模型 Key · 去设置里填一个</a>' : ''}
             </div>
           </div>
 
@@ -1133,6 +1138,148 @@ views.audit = {
 };
 
 /* ---------------- 视图：设置 ---------------- */
+/* ---------------- 设置：AI 模型面板 ---------------- */
+function llmBadge() {
+  const l = S.llm || {};
+  if (!l.hasKey) return '<span class="badge">未配置 · 本地引擎</span>';
+  if (l.lastTest && l.lastTest.ok) return '<span class="badge badge-green">连接正常</span>';
+  if (l.lastTest && !l.lastTest.ok) return '<span class="badge badge-amber">上次测试失败</span>';
+  return '<span class="badge badge-green">已配置 Key</span>';
+}
+
+function llmPanelHtml() {
+  const l = S.llm || {};
+  const presets = S.presets || [];
+  const matched = presets.find((p) => p.baseUrl && l.baseUrl && p.baseUrl.replace(/\/+$/, '') === String(l.baseUrl).replace(/\/+$/, ''))
+    || presets.find((p) => p.id === l.provider)
+    || null;
+  const opts = presets.map((p) => `<option value="${esc(p.id)}"${matched && matched.id === p.id ? ' selected' : ''}>${esc(p.label)}</option>`).join('');
+  const modelList = ((matched && matched.models) || []).map((m) => `<option value="${esc(m)}"></option>`).join('');
+  const keyUrl = matched && matched.keyUrl;
+  const last = l.lastTest;
+
+  return `
+    <div class="panel">
+      <div class="panel-head"><h3>AI 模型</h3><div class="spacer" style="flex:1"></div><span id="llm-badge-slot">${llmBadge()}</span></div>
+      <div class="panel-body">
+        <div class="tiny muted" style="line-height:1.8;margin-bottom:12px">
+          填<b>你自己的</b>模型 Key。它只存在这台服务器的 <span class="mono">data/</span> 里（AES-256-GCM 加密），不会写进部署文件，也不会回传给浏览器。不填也能用，系统会退回本地规则引擎。
+        </div>
+        <label class="field" style="margin-bottom:10px"><span>服务商</span>
+          <select class="input" id="llm-provider">${opts}</select>
+        </label>
+        <label class="field" style="margin-bottom:10px"><span>接口地址（Base URL）</span>
+          <input class="input" id="llm-base" value="${esc(l.baseUrl || '')}" placeholder="https://api.groq.com/openai/v1">
+        </label>
+        <label class="field" style="margin-bottom:10px"><span>模型名</span>
+          <input class="input" id="llm-model" value="${esc(l.model || '')}" list="llm-models" placeholder="qwen/qwen3.8-27b">
+          <datalist id="llm-models">${modelList}</datalist>
+        </label>
+        <label class="field" style="margin-bottom:8px"><span>API Key</span>
+          <input class="input" id="llm-key" type="password" autocomplete="new-password" spellcheck="false"
+                 placeholder="${l.hasKey ? `已保存 ${esc(l.keyMask)} · 留空表示不修改` : '粘贴你的 API Key'}">
+        </label>
+        <div class="tiny muted" style="line-height:1.7;margin-bottom:12px">
+          ${keyUrl ? `没有 Key？去 <a href="${esc(keyUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--indigo)">${esc(matched.label)}</a> 免费申请一个。` : '支持任意 OpenAI 兼容接口，包括本地 Ollama（如 http://127.0.0.1:11434/v1）。'}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" id="llm-save">保存</button>
+          <button class="btn btn-ghost btn-sm" id="llm-test">测试连接</button>
+          ${l.hasKey ? '<button class="btn btn-danger btn-sm" id="llm-clear">清除 Key</button>' : ''}
+        </div>
+        <div id="llm-result" style="margin-top:10px">
+          ${last ? `<div class="tiny ${last.ok ? '' : 'muted'}" style="color:${last.ok ? 'var(--green)' : 'var(--red)'}">
+            ${last.ok ? '上次测试通过' : '上次测试失败'} · ${esc(last.model || '')} · ${rel(last.at)}${last.ok ? '' : ` · ${esc(last.error || '')}`}
+          </div>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function bindLlmPanel() {
+  const provider = $('#llm-provider');
+  const base = $('#llm-base');
+  const model = $('#llm-model');
+  const key = $('#llm-key');
+  const result = $('#llm-result');
+  if (!provider || !base || !model || !key) return;
+
+  provider.addEventListener('change', () => {
+    const p = (S.presets || []).find((x) => x.id === provider.value);
+    if (!p || p.id === 'custom') return;
+    base.value = p.baseUrl;
+    model.value = p.model;
+    const list = $('#llm-models');
+    if (list) list.innerHTML = (p.models || []).map((m) => `<option value="${esc(m)}"></option>`).join('');
+  });
+
+  function payload() {
+    return {
+      provider: provider.value,
+      baseUrl: base.value,
+      model: model.value,
+      apiKey: key.value.trim()
+    };
+  }
+
+  function busy(on, label) {
+    const btns = ['#llm-save', '#llm-test', '#llm-clear'].map((s) => $(s)).filter(Boolean);
+    btns.forEach((b) => { b.disabled = on; });
+    if (on && result) result.innerHTML = `<div class="tiny muted">${esc(label)}</div>`;
+    return btns;
+  }
+
+  $('#llm-save').addEventListener('click', async () => {
+    const btns = busy(true, '保存中…');
+    try {
+      const data = await api('/api/llm', { method: 'PATCH', body: payload() });
+      S.llm = data.llm;
+      S.engine = data.llm.engine;
+      await loadBootstrap();
+      render();
+      toast('模型配置已保存');
+    } catch (e) {
+      toast(e.message, 'err');
+      btns.forEach((b) => { b.disabled = false; });
+      if (result) result.innerHTML = `<div class="tiny" style="color:var(--red)">${esc(e.message)}</div>`;
+    }
+  });
+
+  $('#llm-test').addEventListener('click', async () => {
+    busy(true, '正在请求模型，最多等 30 秒…');
+    try {
+      const r = await api('/api/llm/test', { method: 'POST', body: payload() });
+      S.llm = (await api('/api/llm')).llm;
+      if (r.ok) {
+        result.innerHTML = `<div class="tiny" style="color:var(--green)">连接成功 · ${esc(r.model)} · ${r.latencyMs}ms · 返回「${esc(r.sample || '')}」</div>`;
+        toast('连接成功');
+      } else {
+        result.innerHTML = `<div class="tiny" style="color:var(--red)">${esc(r.error || '连接失败')}</div>`;
+        toast('连接失败', 'err');
+      }
+    } catch (e) {
+      toast(e.message, 'err');
+      result.innerHTML = `<div class="tiny" style="color:var(--red)">${esc(e.message)}</div>`;
+    } finally {
+      ['#llm-save', '#llm-test', '#llm-clear'].map((s) => $(s)).filter(Boolean).forEach((b) => { b.disabled = false; });
+      const badge = $('#llm-badge-slot');
+      if (badge) badge.innerHTML = llmBadge();
+    }
+  });
+
+  const clear = $('#llm-clear');
+  if (clear) clear.addEventListener('click', async () => {
+    if (!confirm('清除后该账号会退回本地规则引擎，确定吗？')) return;
+    try {
+      const data = await api('/api/llm', { method: 'DELETE' });
+      S.llm = data.llm;
+      await loadBootstrap();
+      render();
+      toast('Key 已清除');
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
 views.settings = {
   async load() {
     await loadBootstrap();
@@ -1159,6 +1306,8 @@ views.settings = {
             </label>
           </div>
         </div>
+
+        ${llmPanelHtml()}
 
         <div class="panel">
           <div class="panel-head"><h3>自动化与安全</h3><div class="spacer" style="flex:1"></div><span class="badge ${s.automationPaused ? 'badge-amber' : 'badge-green'}">${s.automationPaused ? '全局暂停' : '运行中'}</span></div>
@@ -1210,6 +1359,7 @@ views.settings = {
           <div class="panel-body">
             <div class="kv"><span class="k">AI 引擎</span><span class="v">${S.engine.engine === 'llm' ? esc(S.engine.model) : '本地规则引擎'}</span></div>
             <div class="kv"><span class="k">模型地址</span><span class="v tiny">${esc(S.engine.baseUrl || '未配置')}</span></div>
+            <div class="kv"><span class="k">Key 来源</span><span class="v tiny">${S.llm && S.llm.hasKey ? '本账号自行填写（加密存储）' : '未填写'}</span></div>
             <div class="kv"><span class="k">Telegram 通道</span><span class="v">${S.telegram.enabled ? (S.telegram.connected ? '已连接 @' + esc(S.telegram.username || '') : '已配置，未连上') : '未配置'}</span></div>
             <div class="kv"><span class="k">通道模式</span><span class="v">Bot API（非个人号凭证）</span></div>
             <div class="panel" style="margin-top:14px;background:#fbfcfe;box-shadow:none">
@@ -1224,6 +1374,7 @@ views.settings = {
       </div>`;
   },
   bind() {
+    bindLlmPanel();
     $$('[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
       const key = b.dataset.toggle;
       const next = !S.settings[key];

@@ -21,6 +21,7 @@ const crypto = require('crypto');
 const db = require('./lib/db');
 const { hashPassword, verifyPassword, newToken } = require('./lib/auth');
 const ai = require('./lib/ai');
+const secret = require('./lib/secret');
 const telegram = require('./lib/telegram');
 
 const PORT = Number(process.env.PORT || 5173);
@@ -179,6 +180,38 @@ function getUsage(userId) {
   return row;
 }
 
+/**
+ * 读取该用户自己的模型配置（内部使用，含解密后的 Key）
+ * 没有配置时 apiKey 为空，引擎会自动降级到本地规则引擎
+ */
+function getLlm(userId) {
+  const data = db.load();
+  const row = data.llmConfigs.find((x) => x.userId === userId);
+  if (!row) return ai.normalizeLlm(null);
+  return ai.normalizeLlm({
+    baseUrl: row.baseUrl,
+    model: row.model,
+    apiKey: secret.decrypt(row.apiKeyEnc)
+  });
+}
+
+/** 返回给前端的版本：只给掩码，绝不返回明文 Key */
+function publicLlm(userId) {
+  const data = db.load();
+  const row = data.llmConfigs.find((x) => x.userId === userId);
+  const cfg = getLlm(userId);
+  return {
+    provider: (row && row.provider) || 'groq',
+    baseUrl: (row && row.baseUrl) || ai.DEFAULT_BASE_URL,
+    model: (row && row.model) || ai.DEFAULT_MODEL,
+    hasKey: Boolean(cfg.apiKey),
+    keyMask: secret.maskKey(cfg.apiKey),
+    updatedAt: (row && row.updatedAt) || null,
+    lastTest: (row && row.lastTest) || null,
+    engine: ai.engineInfo(cfg)
+  };
+}
+
 function inWindow(settings) {
   const now = new Date();
   const cur = now.getHours() * 60 + now.getMinutes();
@@ -271,7 +304,7 @@ route('POST', '/api/auth/register', async (req, res, params, body) => {
     id: userId,
     email,
     passwordHash: hashPassword(password),
-    workspaceName: '我的工作区',
+    workspaceName: String(body.workspaceName || '').trim().slice(0, 40) || '我的工作区',
     assistantType: null,
     createdAt: db.now()
   };
@@ -377,7 +410,9 @@ route('GET', '/api/bootstrap', async (req, res) => {
       knowledge: data.knowledge.filter((k) => k.userId === user.id).length
     },
     audit: data.audit.filter((a) => a.userId === user.id).slice(0, 8),
-    engine: ai.engineInfo(),
+    engine: ai.engineInfo(getLlm(user.id)),
+    llm: publicLlm(user.id),
+    presets: ai.PRESETS,
     telegram: telegram.status()
   });
 });
@@ -548,7 +583,7 @@ function buildDraftContext(user, contact) {
 
 async function generateAndStore(user, contact) {
   const ctx = buildDraftContext(user, contact);
-  const result = await ai.draftReply(ctx);
+  const result = await ai.draftReply(ctx, getLlm(user.id));
   const draft = {
     content: result.text,
     engine: result.engine,
@@ -711,7 +746,7 @@ route('POST', '/api/contacts/:id/translate', async (req, res, params, body) => {
   if (!settings.translationEnabled) return fail(res, 403, '翻译功能已关闭');
   const text = String(body.text || '').slice(0, 4000);
   const target = body.target === 'zh' ? 'zh' : 'en';
-  const result = await ai.translate(text, target);
+  const result = await ai.translate(text, target, getLlm(user.id));
   ok(res, result);
 });
 
@@ -933,6 +968,132 @@ route('GET', '/api/telegram/status', async (req, res) => {
   ok(res, telegram.status());
 });
 
+// ---- 用户自己的模型配置（Key 由用户在网页里填写，不入部署文件）----
+function sanitizeBaseUrl(input) {
+  const raw = String(input || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (_) {
+    return null;
+  }
+  if (!/^https?:$/.test(url.protocol)) return null;
+  if (/^(169\.254\.169\.254|metadata\.google\.internal)$/i.test(url.hostname)) return null;
+  return raw.slice(0, 200);
+}
+
+route('GET', '/api/llm', async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  ok(res, { llm: publicLlm(user.id), presets: ai.PRESETS });
+});
+
+route('PATCH', '/api/llm', async (req, res, params, body) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const data = db.load();
+  const row = data.llmConfigs.find((x) => x.userId === user.id);
+
+  const nextBase = body.baseUrl === undefined
+    ? (row ? row.baseUrl : '')
+    : sanitizeBaseUrl(body.baseUrl);
+  if (nextBase === null) return fail(res, 400, 'Base URL 不合法，需要以 http:// 或 https:// 开头');
+
+  const nextModel = body.model === undefined
+    ? (row ? row.model : '')
+    : String(body.model).trim().slice(0, 80);
+
+  // Key 只有在前端显式提交时才更新；留空表示保持原值（前端拿不到明文，无法回填）
+  let keyEnc = row ? row.apiKeyEnc : '';
+  let keyChanged = false;
+  if (body.clearKey) {
+    keyEnc = '';
+    keyChanged = true;
+  } else if (typeof body.apiKey === 'string' && body.apiKey.trim()) {
+    keyEnc = secret.encrypt(body.apiKey.trim());
+    keyChanged = true;
+  }
+
+  const provider = body.provider === undefined
+    ? ((row && row.provider) || '')
+    : String(body.provider).slice(0, 30);
+  const stamp = db.now();
+
+  db.mutate((d) => {
+    const payload = {
+      userId: user.id,
+      provider,
+      baseUrl: nextBase || ai.DEFAULT_BASE_URL,
+      model: nextModel || ai.DEFAULT_MODEL,
+      apiKeyEnc: keyEnc,
+      updatedAt: stamp
+    };
+    const idx = d.llmConfigs.findIndex((x) => x.userId === user.id);
+    if (idx >= 0) d.llmConfigs[idx] = { ...d.llmConfigs[idx], ...payload };
+    else d.llmConfigs.push({ ...payload, lastTest: null });
+  });
+
+  audit(user.id, 'settings', keyChanged
+    ? (keyEnc ? '更新了自己的模型 API 配置' : '清空了模型 API Key')
+    : '更新了自己的模型名称 / 接口地址');
+  ok(res, { llm: publicLlm(user.id) });
+});
+
+route('DELETE', '/api/llm', async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  db.mutate((d) => {
+    const row = d.llmConfigs.find((x) => x.userId === user.id);
+    if (row) {
+      row.apiKeyEnc = '';
+      row.lastTest = null;
+      row.updatedAt = db.now();
+    }
+  });
+  audit(user.id, 'settings', '删除了自己的模型 API Key');
+  ok(res, { llm: publicLlm(user.id) });
+});
+
+route('POST', '/api/llm/test', async (req, res, params, body) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const saved = getLlm(user.id);
+
+  let baseUrl = saved.baseUrl;
+  if (body.baseUrl !== undefined && String(body.baseUrl).trim()) {
+    const parsed = sanitizeBaseUrl(body.baseUrl);
+    if (parsed === null) return fail(res, 400, 'Base URL 不合法，需要以 http:// 或 https:// 开头');
+    baseUrl = parsed;
+  }
+
+  const typedKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+  const candidate = ai.normalizeLlm({
+    baseUrl,
+    model: body.model || saved.model,
+    apiKey: typedKey || saved.apiKey
+  });
+  if (!candidate.apiKey) return fail(res, 400, '请先填写 API Key 再测试连接');
+
+  const result = await ai.testConnection(candidate);
+
+  db.mutate((d) => {
+    const row = d.llmConfigs.find((x) => x.userId === user.id);
+    if (row) {
+      row.lastTest = {
+        ok: result.ok,
+        model: candidate.model,
+        latencyMs: result.latencyMs || null,
+        error: result.ok ? '' : String(result.error || '').slice(0, 200),
+        at: db.now()
+      };
+    }
+  });
+
+  audit(user.id, 'settings', result.ok ? '测试模型连接成功' : `测试模型连接失败：${String(result.error || '').slice(0, 80)}`);
+  ok(res, result);
+});
+
 // ---------- 演示数据 ----------
 function seedDemo(userId) {
   const c1 = {
@@ -1150,11 +1311,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  const engine = ai.engineInfo();
+  const data = db.load();
+  const configured = data.llmConfigs.filter((x) => x.apiKeyEnc).length;
+  const vault = secret.ensureReady();
   console.log('');
   console.log('  DSchats 复刻版已启动');
   console.log(`  地址:   http://${HOST}:${PORT}`);
-  console.log(`  AI:     ${engine.engine === 'llm' ? `${engine.model} @ ${engine.baseUrl}` : '本地规则引擎（未配置 LLM_API_KEY）'}`);
+  console.log(`  AI:     用户自填 Key（OpenAI 兼容）· 已配置 ${configured}/${data.users.length} 个账号`);
+  console.log(`  降级:   未填 Key 的用户自动使用本地规则引擎`);
+  console.log(`  密钥库: ${vault.ok ? '已就绪 data/.secret' : '⚠️ 无法创建 data/.secret，Key 将无法持久化'}`);
   console.log(`  Telegram: ${telegram.status().enabled ? '已启用' : '未配置（可选）'}`);
   console.log('');
   telegram.start(handleTelegramInbound);
