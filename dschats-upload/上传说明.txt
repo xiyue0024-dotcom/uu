@@ -1,0 +1,33 @@
+上传说明
+====================================
+
+这个文件夹就是完整的运行目录，整个上传到服务器即可（例如 /var/www/dschats）。
+
+上传后执行：
+  cd /var/www/dschats
+  chmod 600 .env
+  chmod 700 data
+  node server.js
+
+然后浏览器打开 http://服务器IP:5173
+（如果用 Nginx 反代，保持 .env 里 HOST=127.0.0.1，把 80/443 转发到 127.0.0.1:5173）
+
+目录说明
+------------------------------------
+server.js            服务入口
+package.json         启动脚本与 Node 版本声明
+lib/                 后端模块（存储、认证、AI、Telegram）
+public/              前端页面与静态资源
+data/                运行时数据目录，首次注册自动生成 db.json
+.env                 运行配置（含 Groq 密钥）
+.env.example         配置模板
+DEPLOY.md            完整部署文档（Nginx / systemd / pm2 / 排错）
+README.md            功能说明与 API 列表
+
+注意
+------------------------------------
+1. .env 内含 API 密钥，不要公开分享这个文件夹。
+2. data/ 必须可写，db.json 是唯一数据源，记得定期备份。
+3. 只能单进程运行，不要用 pm2 cluster 或多实例，否则数据会互相覆盖。
+4. 需要 Node.js 18 及以上；本项目零 npm 依赖，不用 npm install。
+5. 不要放到 Vercel / Netlify 这类无状态托管，必须是有持久磁盘的服务器。
